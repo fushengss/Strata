@@ -411,7 +411,7 @@ class IQ4XS(Base):
             self.assertEqual(fam["sha256"][n], setup.UNSLOTH_SHARDS[n])
         self.assertAlmostEqual(setup.MODELS[X]["download_gb"], 93682584224 / 1e9, places=1)
         self.assertEqual(setup.MODELS[X]["families"], ("unsloth",))
-        self.assertEqual([m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ())], [M, X])
+        self.assertEqual([m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ())], [M, X, "Q8_0"])
         self.assertIsNone(setup.gguf_unsupported(names[0]))                    # #444: a file setup runs now
         self.assertEqual(setup.gguf_choice(names[0]), ("unsloth", X))
         self.assertEqual(setup.budget_model({"args": ["--native", "/m/" + names[0]]}), X)
@@ -519,6 +519,95 @@ class IQ4XS(Base):
             code, out, cfg = self.main(["--context", "8192", "--backend", "hip"], version="0.1.38", amd=r9700, m=X)
         self.assertNotIn("has not been run on AMD cards yet", out)
         self.assertIn("RAM budget: 40 GiB of UD-IQ4_XS's experts", out)
+
+
+class Q8(Base):
+    """Unsloth's plain Q8_0 (docs/UNSLOTH_Q8.md): installed from files already on the disk only (--gguf-dir, no pinned
+    shards to download), the repository folder as ModelScope or Hugging Face lays it out (the shards in Q8_0/)
+    accepted, its RAM budget all of its 128.3 GB of experts on a big PC, and the layer split without it."""
+    Q = "Q8_0"
+
+    def repo(self, n=5):
+        """unsloth/Qwen3.8-Flash-Next-GGUF as downloaded: the MTP file at the top, the shards in Q8_0/."""
+        r = self.t / "unsloth" / "Qwen3.8-Flash-Next-GGUF"
+        (r / "Q8_0").mkdir(parents=True)
+        (r / "MTP").mkdir()
+        (r / "mtp-Qwen3.8-Flash-Next-Q8_0.gguf").write_bytes(b"")
+        for i in range(1, n + 1):
+            (r / "Q8_0" / ("Qwen3.8-Flash-Next-Q8_0-%05d-of-%05d.gguf" % (i, n))).write_bytes(b"")
+        return r
+
+    def install(self, argv, **kw):
+        with mock.patch.object(setup, "whole_shard", lambda s: True):
+            return self.main(argv, version="0.1.40.2", m=self.Q, **kw)
+
+    def test_model(self):
+        d = setup.MODELS[self.Q]
+        self.assertEqual(d["families"], ("unsloth",))
+        self.assertTrue(d["budget"] and d["local_only"] and d["experimental"])
+        self.assertAlmostEqual(d["arena_gb"], 3 * 512 * 640 * 2560 * 34 / 32 * 48 / 1e9, places=1)
+        self.assertIsNone(setup.gguf_unsupported("Qwen3.8-Flash-Next-Q8_0-00001-of-00005.gguf"))
+        self.assertEqual(setup.budget_model({"args": ["--native", "/m/Qwen3.8-Flash-Next-Q8_0-00001-of-00005.gguf"]}),
+                         self.Q)
+        self.assertEqual(setup.resident_budget_gib(self.Q, 377.0), 119)          # every expert (128.3 GB = 119.5 GiB)
+        self.assertEqual(setup.resident_budget_gib(self.Q, 127.8), 104)
+
+    def test_not_downloaded(self):
+        code, out, cfg = self.install(["--context", "8192"], ram=377.0)
+        self.assertEqual(code, 1, out)
+        self.assertIn("Q8_0 is installed from files you already have", out)
+        self.assertIn("--gguf-dir", out)
+        self.assertEqual(self.downloads, [])
+        self.assertIsNone(cfg)
+
+    def test_not_in_the_menu_without_gguf_dir(self):
+        code, out, cfg = self.main(["--context", "8192"], version="0.1.40.2", model=False, m=X)
+        self.assertEqual(code, 0, out)
+        self.assertFalse([ln for ln in out.splitlines() if ln.startswith("  3) ")], out)
+
+    def test_install_from_the_repository_folder(self):
+        r = self.repo()
+        code, out, cfg = self.install(["--context", "8192", "--gguf-dir", str(r)], ram=377.0)
+        self.assertEqual(code, 0, out)
+        self.assertIn("Q8_0 is EXPERIMENTAL (docs/UNSLOTH_Q8.md)", out)
+        self.assertEqual(self.downloads, [])                                     # nothing: no model, no encoder
+        first = str(r / "Q8_0" / "Qwen3.8-Flash-Next-Q8_0-00001-of-00005.gguf")
+        packs = [x for x in self.runs if x[1].endswith("iq_pack.py")]
+        self.assertEqual(len(packs), 1, self.runs)
+        self.assertEqual(packs[0][packs[0].index("--gguf") + 1], first)
+        self.assertIn("--compat-bf16", packs[0])
+        self.assertNotIn("--experts-bin", packs[0])
+        args = cfg["args"]
+        self.assertEqual(args[args.index("--native") + 1], first)
+        self.assertEqual(args[args.index("--resident-budget-gib") + 1], "119")   # all of the experts in RAM
+        self.assertNotIn("--ple-gguf", args)                                     # the engine finds the table's shard
+        self.assertEqual(cfg["model_name"], "qwen3.8-flash-next-unsloth-q8_0")
+        with tempfile.TemporaryDirectory() as t:                                # a start reads the choice back
+            p = Path(t) / "strata-unsloth-q8_0.json"
+            p.write_text(json.dumps(cfg))
+            ch = setup.choices_from_config(p)
+            self.assertEqual((ch["family"], ch["model"]), ("unsloth", self.Q))
+
+    def test_the_shard_folder_itself(self):
+        r = self.repo(n=4)
+        code, out, cfg = self.install(["--context", "8192", "--gguf-dir", str(r / "Q8_0")], ram=377.0)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(cfg["args"][cfg["args"].index("--native") + 1].endswith("Q8_0-00001-of-00004.gguf"))
+
+    def test_eight_gpus(self):
+        r = self.repo()
+        code, out, cfg = self.install(["--context", "32768", "--gguf-dir", str(r), "--gpus", "all"], ram=377.0,
+                                      n_gpus=8)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["gpu"], list(range(8)))
+        self.assertNotIn("--resident-budget-gib", cfg["args"])                  # the split loads every expert
+        self.assertIn("as you chose (--gpus): no RAM budget", out)
+
+    def test_check_verdict(self):
+        code, out, _ = self.main(["--check"], ram=377.0, m=X)
+        self.assertEqual(code, 0, out)
+        line = next(ln for ln in out.splitlines() if ln.strip().startswith(self.Q))
+        self.assertIn("fits with all of its experts in RAM", line)
 
 
 class LayerSplit(unittest.TestCase):

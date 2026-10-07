@@ -145,6 +145,15 @@ START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 **Unsloth's 6-bit UD-Q6_K_XL** (experimental, not in setup's menu) trades more bytes per expert for less precision
 loss against the same files: 169.2 GB together, its PLE table Q8_0 (read by the engine since 0.1.38). High RAM
 machines run it without a RAM budget. Manual workflow: [UD-Q6_K_XL](UNSLOTH_Q6.md).
+
+**Unsloth's 8-bit Q8_0** (experimental) is set up from files you already have: about 188 GB, with 128.3 GB of experts.
+Strata keeps all of them in RAM, so it is for PCs with ~160 GB of RAM or more. Setup does not download it. Details:
+[Q8_0](UNSLOTH_Q8.md).
+
+```
+./setup.sh --setup --family unsloth --model Q8_0 --gguf-dir /path/to/unsloth/Qwen3.8-Flash-Next-GGUF
+```
+
 ### OrcaRouter Uncensored IQ3_XXS
 
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an

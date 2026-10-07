@@ -230,6 +230,18 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
+    # EXPERIMENTAL (docs/UNSLOTH_Q8.md): Unsloth's plain Q8_0 - every routed expert Q8_0 (gate/up and down: the grouped
+    # GPU kernels, MMQ and ggml-cpu take it), the dense side as UD-Q4_K_XL's and the PLE table Q8_0 (170-byte
+    # rows).  Experts: 3 x 512 x 640 x 2560 x 34/32 bytes x 48 layers = 128.3 GB; the files ~188 GB (UD-Q6_K_XL's
+    # 59.9 GB beside its experts, plus these).  Its shard count and hashes are not pinned here, so it is installed from
+    # files already on the disk only (--gguf-dir; "local_only"), and its RAM budget holds every expert from ~160 GB.
+    "Q8_0": {"about": "8-bit (Unsloth), EXPERIMENTAL: the closest to the full model; for PCs with ~160 GB of RAM or "
+                      "more, from files you already have (--gguf-dir)",
+             "download_gb": 188.3, "ram_gb": 160, "arena_gb": 128.3, "families": ("unsloth",), "budget": True,
+             "experimental": True, "local_only": True, "engine": (0, 1, 38),
+             "warning": "Q8_0 is EXPERIMENTAL (docs/UNSLOTH_Q8.md): its 128 GB of 8-bit experts are read from RAM "
+                        "for every token the GPU's cache does not hold, so it is slower than the 2-4-bit models",
+             "vision": True, "vision_untested": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -1384,7 +1396,11 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
     """--gguf-dir's shards (#305): every -0000i-of-0000N file of the model, N read from the first shard's name as the
     engine and tools/iq_pack.py do.  The published name first; else the one first shard in the folder whose name has
     the size in it (an upload split or named differently: -00001-of-00003, Unsloth's ...-00001-of-00004.gguf).  A
-    missing shard is check_shards' error later, as before."""
+    missing shard is check_shards' error later, as before.  A repository folder as Hugging Face or ModelScope lays it
+    out (unsloth/Qwen3.8-Flash-Next-GGUF with the shards in Q8_0/) is looked into when its top holds no first shard."""
+    sub = folder / model
+    if sub.is_dir() and not any(SHARD_NAME.search(p.name) for p in folder.glob("*-00001-of-*.gguf")):
+        folder = sub
     first = folder / model_file(fam, model, 1)
     if not first.exists():
         found = sorted(p for p in folder.glob("*-00001-of-*.gguf") if SHARD_NAME.search(p.name))
@@ -1404,7 +1420,7 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL and UD-IQ4_XS only: other GGUFs (Unsloth's "
+                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL, UD-IQ4_XS and Q8_0 only: other GGUFs (Unsloth's "
                    "UD-IQ3_XXS or "
                    "UD-Q2_K_XL, K-quants) cannot be used")
 
@@ -4801,9 +4817,13 @@ def main() -> int:
         for m, d in MODELS.items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             if d.get("budget"):
+                every = resident_budget_gib(m, ram) >= int(d["arena_gb"] / 1.073741824)
                 verdict = (("EXPERIMENTAL, " if d.get("experimental") else "") +
-                           f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest "
-                           "read from the SSD" if ram >= d["ram_gb"] else "does not fit")
+                           ("fits with all of its experts in RAM" if every else
+                            f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest "
+                            "read from the SSD") if ram >= d["ram_gb"] else "does not fit")
+                if d.get("local_only"):
+                    verdict += " (from files you already have: --gguf-dir)"
                 if hip:                                # #429: not run on AMD yet (its prompt kernels are CUDA-only)
                     verdict += " - NVIDIA only so far, untested on AMD"
             elif low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
@@ -4839,8 +4859,13 @@ def main() -> int:
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
     say()
-    names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
+    names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))
+             and (not MODELS[m].get("local_only") or a.gguf_dir or a.model == m)]   # Q8_0: from --gguf-dir only
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
+    if a.model in names and MODELS[a.model].get("local_only") and not a.gguf_dir:
+        fail(f"{a.model} is installed from files you already have: setup does not download it",
+             f"add --gguf-dir <the folder with its *-00001-of-0000N.gguf shards> (Unsloth's repository folder works "
+             f"too: setup looks in its {a.model}/ subfolder)")
     if a.model and a.model not in names:
         # #444: say which family has that size, and (with --gguf-dir) which files Strata can run at all
         elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
@@ -4867,7 +4892,8 @@ def main() -> int:
         # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split) unless
         # the RAM holds the GGUFs and 24 GB more: then several, without the budget, if asked for (#498)
         if MODELS[model].get("experimental"):
-            warn(f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
+            warn(MODELS[model].get("warning") or
+                 f"{model} is EXPERIMENTAL (docs/UNSLOTH_Q4.md): most of its experts are read from the SSD while it "
                  "answers, so it is several times slower than the 2-3-bit models; quality checked against llama.cpp")
         if hip and MODELS[model].get("nvidia_only"):
             # #429 (jkuepker): checked before the 111 GB download.  The HIP engine has no prompt kernels for its
