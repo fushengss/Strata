@@ -172,6 +172,20 @@ tok/s, at 0.7 -> 358 tok/s.
 `--trim-stage-weights` alone raised the share of experts held in VRAM on that machine from 76-85 % to 84-100 %
 per card.
 
+An 8-GPU layer split (8x RTX 2080 Ti 22 GB, PCIe 3.0, no P2P), Unsloth Q8_0 with every expert in VRAM, engine
+0.1.40.3, `"layer_split": "auto"` and no `--trim-stage-weights`, through the HTTP server: C different requests sent
+at once, 256 tokens each, greedy, one round:
+
+| Setting | Alone: decode | C = 1: total | C = 4: total / last done | C = 8: total / last done |
+| --- | ---: | ---: | ---: | ---: |
+| one at a time | 57.4 tok/s | 51.9 tok/s | 50.7 tok/s / 20.2 s | 50.2 tok/s / 40.8 s |
+| `"parallel": 4`, `--batch-groups 4` | 56.0 tok/s | 49.9 tok/s | 105.4 tok/s / 9.7 s | 136.1 tok/s / 15.0 s |
+| `"parallel": 8`, `--batch-groups 8` | 54.2 tok/s | 43.5 tok/s | 84.6 tok/s / 12.1 s | 129.0 tok/s / 15.9 s |
+
+Four slots beat eight there: the slots' sessions took 57 of each card's 3,072 expert-cache slots with four and 268
+with eight, so with eight more experts ran on the CPU; four groups already keep the eight cards busy. With fewer
+cache slots a request alone also gives a different (equally coherent) greedy text than without `"parallel"`.
+
 ## Together with conversation parking
 
 `--conversation-cache-mib N --conversation-cache-slots K` (DETAILS.md) works with the layer split too: a request

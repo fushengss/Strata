@@ -4286,6 +4286,7 @@ def parallel_note(asked: int | None, vram_gbs, arena_gb: float, ctx: int, kv: st
 
 PREFILL_BIG_RAM_GB = 96        # bench #433 #440 #834 #669: --prefill auto:32768 +21-35% at 96 GB, ~3x slower at 32 GB
 PREFILL_RISK_RAM_GB = 64       # below this an explicit auto:32768 is warned about
+SPLIT_CHUNKS_GPUS = 4          # --split-chunks 4 is suggested from this many GPUs (measured on 8, docs/MULTI_GPU.md)
 HEADROOM_RAM_GB = 48           # bench #834: STRATA_RESIDENT_HEADROOM_GIB=6 on a PC with this much RAM or less
 AGENT_CACHE_FREE_GB = 24       # bench #882 #440: RAM left beside the model for the conversation cache
 AGENT_CACHE_MIB = 8192
@@ -4297,22 +4298,33 @@ def arg_after(args, flag):
     return args[args.index(flag) + 1] if flag in args[:-1] else None
 
 
-def bench_tips(args, env, ram: float, model_ram_gb: float, vram_gb: float, vision: str, win: bool) -> list[str]:
+def bench_tips(args, env, ram: float, model_ram_gb: float, vram_gb: float, vision: str, win: bool,
+               gpus: int = 1) -> list[str]:
     """Recommendations from the community bench data (plan 0.1.40 item 14).  Text only: nothing here changes a
     default, the config or the engine's arguments (recommend, never force).  `ram` is this PC's RAM, `model_ram_gb`
-    what the chosen model keeps in it."""
+    what the chosen model keeps in it, `gpus` how many cards the model is split across."""
     tips = []
     cache = arg_after(args, "--expert-cache")
     if win and cache is not None and cache != "auto":
         tips.append(f"warning: --expert-cache {cache} is a fixed size. On Windows, a size that leaves almost no VRAM free "
                     "has run up to 7x slower (#780 #781); a smaller number, or auto, leaves the driver room")
     prefill = arg_after(args, "--prefill")
-    if prefill == "auto:32768" and ram < PREFILL_RISK_RAM_GB:
+    if gpus > 1 and prefill in ("auto:16384", "auto:32768"):
+        tips.append(f"warning: --prefill {prefill} on a layer split across {gpus} GPUs: a chunk that big borrows most of "
+                    "every card's expert cache, whose experts then cross PCIe again for every prompt, and the cards read "
+                    "it one after another. --prefill auto read 16K-token prompts 1.6x and 32K-token prompts 2.4x faster "
+                    "(8x RTX 2080 Ti, Unsloth Q8_0, engine 0.1.40.3; docs/MULTI_GPU.md, Chunk size on a split)")
+    elif prefill == "auto:32768" and ram < PREFILL_RISK_RAM_GB:
         tips.append(f"warning: --prefill auto:32768 on {ram:.0f} GB of RAM: it ran ~3x slower than --prefill auto with "
                     "32 GB (#834 #669); it paid off (+21-35%) with 96 GB")
-    elif prefill == "auto" and ram >= PREFILL_BIG_RAM_GB:
+    elif prefill == "auto" and ram >= PREFILL_BIG_RAM_GB and gpus <= 1:
         tips.append(f"tip: with {ram:.0f} GB of RAM, --prefill auto:32768 in the config's args read prompts 21-35% "
                     "faster in community benchmarks (#433 #440 #834); not set, nothing changes")
+    if gpus >= SPLIT_CHUNKS_GPUS and "--split-chunks" not in args:
+        tips.append(f"tip: on a layer split across {gpus} GPUs, --split-chunks 4 in the config's args reads a prompt in "
+                    "about 4 chunks of 2048-4096 tokens, so the cards work on different chunks at once: 4K-token prompts "
+                    "+30%, 16K +25% and 32K +15% over --prefill auto (8x RTX 2080 Ti, Unsloth Q8_0; needs an engine "
+                    "built from this source); not set, nothing changes")
     resident = any(a in args for a in ("--resident-experts", "--resident-budget-gib"))
     if resident and ram <= HEADROOM_RAM_GB and "STRATA_RESIDENT_HEADROOM_GIB" not in (env or {}):
         tips.append(f"tip: on a PC with {ram:.0f} GB of RAM, \"env\": {{\"STRATA_RESIDENT_HEADROOM_GIB\": \"6\"}} in the "
@@ -5476,7 +5488,8 @@ def main() -> int:
         cfg["args"] = recommend_pool_workers(cfg["args"])
         for line in two_socket_note(cpu_sockets()):    # bench tips: text only, the config is not touched
             say("  " + line)
-    for line in bench_tips(cfg["args"], cfg.get("env"), ram, MODELS[model]["ram_gb"], gpu.get("vram_gb", 0.0), vision, WIN):
+    for line in bench_tips(cfg["args"], cfg.get("env"), ram, MODELS[model]["ram_gb"], gpu.get("vram_gb", 0.0), vision, WIN,
+                           len(cfg["gpu"]) if isinstance(cfg.get("gpu"), list) else 1):
         say("  " + line)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)

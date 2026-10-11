@@ -510,6 +510,9 @@ struct Options {
     /// #282, opt-in: the largest chunk `--prefill auto` may take - 8192 by default; `--prefill auto:16384` or
     /// `auto:32768` (or STRATA_PREFILL_AUTO_MAX) lets it go further, never past the context
     int64_t prefill_auto_max = 8192;
+    /// opt-in: on a layer split, a served prompt reads in about this many chunks of 2048-4096 tokens (never above
+    /// --prefill's chunk), so the stages read different chunks at once and each lends fewer cache slots (0 = off)
+    int64_t split_chunks = 0;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -778,6 +781,8 @@ void usage() {
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones\n"
+                 "  --split-chunks N     opt-in, a layer split serving: a prompt reads in about N chunks of 2048-4096\n"
+                 "                       tokens (at most --prefill's chunk), so the cards read different chunks at once\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
                  "  --sync-every-layer   debug: synchronise after every layer\n"
                  "  --ple-gguf PATH      the n-gram/PLE shard.  WITHOUT IT LAYER 1's PLE IS SILENTLY SKIPPED,\n"
@@ -1719,6 +1724,7 @@ int main(int argc, char** argv) {
             o.prefill_auto_max = want_max >= 32768 ? 32768 : want_max >= 16384 ? 16384 : 8192;
             o.prefill_chunk = o.prefill_auto ? o.prefill_auto_max : std::atoll(v.c_str());
         }
+        else if (a == "--split-chunks") o.split_chunks = std::atoll(next("--split-chunks"));
         else if (a == "--no-split-rows") o.no_split_rows = true;
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--vram-elastic") o.vram_elastic = true;
@@ -9444,7 +9450,17 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = equal_chunk(tokens, o.prefill_chunk);
+                int64_t cap = o.prefill_chunk;
+                if (o.split_chunks > 0 && n_stages > 1) {
+                    // --split-chunks N: about N chunks of 2048-4096 tokens.  One big chunk walks the stages one after
+                    // another and lends most of every stage's cache (those experts then cross PCIe for the prompt);
+                    // smaller ones pipeline through the stages.  8x RTX 2080 Ti, Unsloth Q8_0, N = 4 picks 2048 for
+                    // 4K prompts (920 tok/s against 740 in one chunk) and 4096 for 16K / 32K (1,830 / 2,330 tok/s
+                    // against 1,480 / 2,050 in --prefill auto's 8192 and 900 / 850 in auto:32768's 27,904).
+                    const int64_t per = (tokens + o.split_chunks - 1) / o.split_chunks;
+                    cap = std::min(cap, std::clamp<int64_t>((per + 255) / 256 * 256, 2048, 4096));
+                }
+                const int64_t want_full = equal_chunk(tokens, cap);
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
                 const int64_t want = split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
                                                                                  : want_full;

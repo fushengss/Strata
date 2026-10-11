@@ -149,6 +149,27 @@ Prompts are read in chunks that flow through the cards in turn; while a later ca
 already reads chunk c+1. Conversation checkpoints save and restore every card's state; the adaptive expert swaps copy
 into the card that owns the layer.
 
+**Chunk size on a split.** A prompt in one big chunk reaches the cards one after another, and the chunk's buffers
+borrow most of every card's expert cache, so those experts cross PCIe again during the prompt and are copied back
+after it. `--prefill auto:32768` on 8 cards borrowed 2,295 of each card's 3,072 slots. `--split-chunks N` (opt-in,
+serving) reads a prompt in about N chunks of 2048-4096 tokens, never above `--prefill`'s chunk. Measured on
+8x RTX 2080 Ti (Unsloth Q8_0, every expert in VRAM, engine 0.1.40.3, prompt tok/s, two requests each):
+
+| Prompt | `auto:32768` | `auto` (8192) | `4096` | `2048` | `auto` + `--split-chunks 4` |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4K | 713-751 | 697-750 | 688-741 | 917-932 | 937-952 |
+| 16K | 891-908 | 1,466-1,498 | 1,797-1,858 | 1,769-1,797 | 1,838-1,864 |
+| 32K | 809-883 | 1,996-2,112 | 2,299-2,360 | 2,054-2,058 | 2,330-2,373 |
+
+Decode speed and the greedy text of a short prompt stayed the same. On a single card nothing changes.
+
+**The stages' host threads (Linux).** The host thread is pinned to one core, and the threads it started for the
+other stages' prompt work, the expert copies and the PLE rows used to inherit that core: on 8 cards 35 of the
+engine's threads shared CPU 0, and the GPUs spent 14% of a prompt's GPU time waiting for it (`host grouping` in
+`STRATA_PREFILL_TIMING=1`). Those threads now run on every CPU the process may use. Same 8x RTX 2080 Ti with
+`--split-chunks 4`: host grouping 8.4 s -> 0.4 s of the two prompts' GPU time (59 s -> 51 s), 16K-token prompts
+1,838-1,864 -> 1,953-2,019 tok/s, 32K 2,330-2,373 -> 2,553-2,664; decode and its greedy text unchanged.
+
 ## Limits (for now)
 
 - **Works across cards** (bench/results/2026-09-29-layer-split-limits):

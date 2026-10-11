@@ -18,8 +18,8 @@ from test_setup_hybrid import fake_sys  # noqa: E402
 BASE = ["--expert-cache", "auto", "--prefill", "auto", "--max-context", "65536"]
 
 
-def tips(args=BASE, env=None, ram=32.0, model=20.0, vram=12.0, vision="none", win=False):
-    return setup.bench_tips(list(args), env, ram, model, vram, vision, win)
+def tips(args=BASE, env=None, ram=32.0, model=20.0, vram=12.0, vision="none", win=False, gpus=1):
+    return setup.bench_tips(list(args), env, ram, model, vram, vision, win, gpus)
 
 
 class BenchTips(unittest.TestCase):
@@ -38,6 +38,21 @@ class BenchTips(unittest.TestCase):
         big = ["--prefill", "auto:32768"]
         self.assertTrue(any(t.startswith("warning") and "auto:32768" in t for t in tips(big, ram=32)))
         self.assertEqual([t for t in tips(big, ram=96) if "auto:32768" in t], [])
+
+    def test_big_prefill_chunks_on_a_layer_split(self):
+        # 8x RTX 2080 Ti, 377 GB: no auto:32768 tip on a split, and a warning when the config already has it
+        self.assertEqual([t for t in tips(ram=377, gpus=8) if "auto:32768" in t], [])
+        for big in ("auto:32768", "auto:16384"):
+            w = [t for t in tips(["--prefill", big], ram=377, gpus=8) if big in t]
+            self.assertEqual(len(w), 1)
+            self.assertTrue(w[0].startswith("warning") and "8 GPUs" in w[0] and "--prefill auto " in w[0])
+        self.assertEqual([t for t in tips(["--prefill", "auto:32768"], ram=377, gpus=1) if "auto:32768" in t], [])
+
+    def test_split_chunks_on_a_big_split(self):
+        self.assertTrue(any("--split-chunks 4" in t and t.startswith("tip") for t in tips(ram=377, gpus=8)))
+        self.assertEqual([t for t in tips(ram=377, gpus=2) if "--split-chunks" in t], [])
+        self.assertEqual([t for t in tips(ram=377, gpus=1) if "--split-chunks" in t], [])
+        self.assertEqual([t for t in tips([*BASE, "--split-chunks", "4"], ram=377, gpus=8) if "--split-chunks" in t], [])
 
     def test_resident_headroom_on_small_ram(self):
         res = [*BASE, "--resident-experts"]
